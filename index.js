@@ -1,22 +1,35 @@
 require('dotenv').config();
 const { Telegraf, Markup } = require('telegraf');
-const { Low } = require('lowdb');
-const { JSONFile } = require('lowdb/node');
 const { v4: uuidv4 } = require('uuid');
+const fs = require('fs');
 const path = require('path');
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 const ADMIN_ID = Number(process.env.ADMIN_ID);
 
-// ========== Database ==========
-const adapter = new JSONFile(path.join(__dirname, 'db.json'));
-const db = new Low(adapter, { users: {}, servers: [] });
+// ========== Simple JSON Database ==========
+const DB_PATH = path.join(__dirname, 'db.json');
 
-async function initDB() {
-  await db.read();
-  db.data ||= { users: {}, servers: [] };
-  await db.write();
+function loadDB() {
+  try {
+    if (fs.existsSync(DB_PATH)) {
+      return JSON.parse(fs.readFileSync(DB_PATH, 'utf8'));
+    }
+  } catch (e) {
+    console.error('DB load error:', e.message);
+  }
+  return { users: {}, servers: [] };
 }
+
+function saveDB(data) {
+  try {
+    fs.writeFileSync(DB_PATH, JSON.stringify(data, null, 2));
+  } catch (e) {
+    console.error('DB save error:', e.message);
+  }
+}
+
+let db = loadDB();
 
 // ========== Helpers ==========
 function isAdmin(ctx) {
@@ -25,15 +38,15 @@ function isAdmin(ctx) {
 
 function getUser(ctx) {
   const id = String(ctx.from.id);
-  if (!db.data.users[id]) {
-    db.data.users[id] = {
+  if (!db.users[id]) {
+    db.users[id] = {
       id,
-      username: ctx.from.username || ctx.from.first_name,
-      createdAt: new Date().toISOString(),
-      isAdmin: id == ADMIN_ID
+      username: ctx.from.username || ctx.from.first_name || 'User',
+      createdAt: new Date().toISOString()
     };
+    saveDB(db);
   }
-  return db.data.users[id];
+  return db.users[id];
 }
 
 const EGGS = {
@@ -50,11 +63,11 @@ const PLANS = [
   { ram: 32, name: '32 GB' }
 ];
 
+const userState = {};
+
 // ========== Start ==========
 bot.start(async (ctx) => {
-  await initDB();
   const user = getUser(ctx);
-  await db.write();
 
   const text = `🪺 *Nestly Free Bot*
 
@@ -63,20 +76,15 @@ Welcome ${user.username}!
 Everything is completely free and unlimited.
 No coins. No restrictions.
 
-Use the buttons below or these commands:
-/myservers - View your servers
-/create - Create a new server
-${isAdmin(ctx) ? '/admin - Admin panel' : ''}`;
+Use the buttons below:`;
 
   await ctx.replyWithMarkdown(text, Markup.keyboard([
     ['📦 My Servers', '➕ Create Server'],
-    isAdmin(ctx) ? ['👑 Admin Panel'] : []
+    ...(isAdmin(ctx) ? [['👑 Admin Panel']] : [])
   ]).resize());
 });
 
-// ========== Create Server Flow ==========
-const userState = {}; // temporary state
-
+// ========== Create Server ==========
 bot.hears(['➕ Create Server', '/create'], async (ctx) => {
   userState[ctx.from.id] = { step: 'egg' };
   await ctx.reply('Choose what to deploy:', Markup.inlineKeyboard([
@@ -88,9 +96,14 @@ bot.hears(['➕ Create Server', '/create'], async (ctx) => {
 
 bot.action(/egg_(.+)/, async (ctx) => {
   const egg = ctx.match[1];
-  userState[ctx.from.id] = { step: 'plan', egg };
+  userState[ctx.from.id] = { 
+    ...(userState[ctx.from.id] || {}),
+    step: 'plan', 
+    egg 
+  };
   await ctx.answerCbQuery();
-  await ctx.editMessageText(`Selected: ${EGGS[egg].icon} ${EGGS[egg].name}\n\nChoose RAM (all free):`, 
+  await ctx.editMessageText(
+    `Selected: ${EGGS[egg].icon} ${EGGS[egg].name}\n\nChoose RAM (all free):`,
     Markup.inlineKeyboard(
       PLANS.map(p => [Markup.button.callback(`${p.name} RAM`, `plan_${p.ram}`)])
     )
@@ -105,9 +118,13 @@ bot.action(/plan_(\d+)/, async (ctx) => {
   state.ram = ram;
   state.step = 'name';
   await ctx.answerCbQuery();
-  await ctx.editMessageText(`Selected: ${ram} GB RAM\n\nNow send me the *name* of the server:`, { parse_mode: 'Markdown' });
+  await ctx.editMessageText(
+    `Selected: ${ram} GB RAM\n\nNow send me the *name* of the server:`,
+    { parse_mode: 'Markdown' }
+  );
 });
 
+// Handle server name
 bot.on('text', async (ctx) => {
   const state = userState[ctx.from.id];
   if (!state || state.step !== 'name') return;
@@ -117,20 +134,21 @@ bot.on('text', async (ctx) => {
     return ctx.reply('Name must be between 2-32 characters. Try again:');
   }
 
-  // Create the server
+  const ownerId = state.targetOwner || String(ctx.from.id);
+
   const server = {
     id: uuidv4().slice(0, 8),
-    ownerId: String(ctx.from.id),
+    ownerId,
     name,
     egg: state.egg,
     ram: state.ram,
     status: 'active',
     createdAt: new Date().toISOString(),
-    createdBy: isAdmin(ctx) ? 'admin' : 'user'
+    createdBy: state.targetOwner ? 'admin' : 'user'
   };
 
-  db.data.servers.push(server);
-  await db.write();
+  db.servers.push(server);
+  saveDB(db);
   delete userState[ctx.from.id];
 
   const eggInfo = EGGS[server.egg];
@@ -141,18 +159,13 @@ bot.on('text', async (ctx) => {
     `*RAM:* ${server.ram} GB\n` +
     `*ID:* \`${server.id}\`\n` +
     `*Status:* Active\n\n` +
-    `Everything is free — create as many as you want!`,
-    Markup.keyboard([
-      ['📦 My Servers', '➕ Create Server'],
-      isAdmin(ctx) ? ['👑 Admin Panel'] : []
-    ]).resize()
+    `Everything is free — create as many as you want!`
   );
 });
 
 // ========== My Servers ==========
 bot.hears(['📦 My Servers', '/myservers'], async (ctx) => {
-  await initDB();
-  const myServers = db.data.servers.filter(s => s.ownerId === String(ctx.from.id));
+  const myServers = db.servers.filter(s => s.ownerId === String(ctx.from.id));
 
   if (myServers.length === 0) {
     return ctx.reply('You have no servers yet.\nPress ➕ Create Server to make one (completely free).');
@@ -174,16 +187,15 @@ bot.hears(['📦 My Servers', '/myservers'], async (ctx) => {
 
 bot.action(/delete_(.+)/, async (ctx) => {
   const id = ctx.match[1];
-  const server = db.data.servers.find(s => s.id === id);
+  const server = db.servers.find(s => s.id === id);
   if (!server) return ctx.answerCbQuery('Server not found');
 
-  // Only owner or admin can delete
   if (server.ownerId !== String(ctx.from.id) && !isAdmin(ctx)) {
     return ctx.answerCbQuery('You can only delete your own servers');
   }
 
-  db.data.servers = db.data.servers.filter(s => s.id !== id);
-  await db.write();
+  db.servers = db.servers.filter(s => s.id !== id);
+  saveDB(db);
   await ctx.answerCbQuery('Server deleted');
   await ctx.editMessageText(`🗑 Server *${server.name}* has been deleted.`, { parse_mode: 'Markdown' });
 });
@@ -192,16 +204,15 @@ bot.action(/delete_(.+)/, async (ctx) => {
 bot.hears(['👑 Admin Panel', '/admin'], async (ctx) => {
   if (!isAdmin(ctx)) return ctx.reply('⛔ Admin only.');
 
-  const totalUsers = Object.keys(db.data.users).length;
-  const totalServers = db.data.servers.length;
+  const totalUsers = Object.keys(db.users).length;
+  const totalServers = db.servers.length;
 
   await ctx.replyWithMarkdown(
     `👑 *Admin Panel*\n\n` +
     `👥 Users: ${totalUsers}\n` +
     `🖥️ Servers: ${totalServers}\n\n` +
     `Commands:\n` +
-    `/allservers - List every server\n` +
-    `/createfor <user_id> - Create server for a user\n` +
+    `/createfor <user_id> - Create server for any user\n` +
     `/broadcast <message> - Message all users`,
     Markup.inlineKeyboard([
       [Markup.button.callback('📋 All Servers', 'admin_allservers')],
@@ -214,16 +225,16 @@ bot.action('admin_allservers', async (ctx) => {
   if (!isAdmin(ctx)) return;
   await ctx.answerCbQuery();
 
-  if (db.data.servers.length === 0) {
+  if (db.servers.length === 0) {
     return ctx.reply('No servers exist yet.');
   }
 
-  let text = `🖥️ *All Servers* (${db.data.servers.length})\n\n`;
-  db.data.servers.forEach(s => {
+  let text = `🖥️ *All Servers* (${db.servers.length})\n\n`;
+  db.servers.forEach(s => {
     const egg = EGGS[s.egg];
-    const owner = db.data.users[s.ownerId]?.username || s.ownerId;
+    const owner = db.users[s.ownerId]?.username || s.ownerId;
     text += `${egg.icon} *${s.name}* (${s.ram}GB)\n` +
-            `   Owner: @${owner} | ID: \`${s.id}\`\n\n`;
+            `   Owner: ${owner} | ID: \`${s.id}\`\n\n`;
   });
   await ctx.replyWithMarkdown(text);
 });
@@ -233,8 +244,8 @@ bot.action('admin_users', async (ctx) => {
   await ctx.answerCbQuery();
 
   let text = `👥 *Users*\n\n`;
-  Object.values(db.data.users).forEach(u => {
-    const count = db.data.servers.filter(s => s.ownerId === u.id).length;
+  Object.values(db.users).forEach(u => {
+    const count = db.servers.filter(s => s.ownerId === u.id).length;
     text += `• ${u.username} (\`${u.id}\`) — ${count} servers\n`;
   });
   await ctx.replyWithMarkdown(text);
@@ -246,11 +257,12 @@ bot.command('createfor', async (ctx) => {
 
   const args = ctx.message.text.split(' ');
   if (args.length < 2) {
-    return ctx.reply('Usage: /createfor <telegram_user_id>\nThen follow the normal create flow.');
+    return ctx.reply('Usage: /createfor <telegram_user_id>');
   }
 
   const targetId = args[1];
   userState[ctx.from.id] = { step: 'egg', targetOwner: targetId };
+
   await ctx.reply(`Creating server for user \`${targetId}\`\n\nChoose egg:`, {
     parse_mode: 'Markdown',
     ...Markup.inlineKeyboard([
@@ -261,42 +273,14 @@ bot.command('createfor', async (ctx) => {
   });
 });
 
-// Override create when admin is creating for someone else
-bot.on('text', async (ctx, next) => {
-  const state = userState[ctx.from.id];
-  if (state?.targetOwner && state.step === 'name') {
-    const name = ctx.message.text.trim();
-    const server = {
-      id: uuidv4().slice(0, 8),
-      ownerId: state.targetOwner,
-      name,
-      egg: state.egg,
-      ram: state.ram,
-      status: 'active',
-      createdAt: new Date().toISOString(),
-      createdBy: 'admin'
-    };
-    db.data.servers.push(server);
-    await db.write();
-    delete userState[ctx.from.id];
-
-    await ctx.replyWithMarkdown(
-      `✅ Admin created server for user \`${state.targetOwner}\`\n\n` +
-      `*${server.name}* | ${server.ram}GB | ID: \`${server.id}\``
-    );
-    return;
-  }
-  return next();
-});
-
-// ========== Broadcast ==========
+// Broadcast
 bot.command('broadcast', async (ctx) => {
   if (!isAdmin(ctx)) return;
   const msg = ctx.message.text.replace('/broadcast', '').trim();
   if (!msg) return ctx.reply('Usage: /broadcast your message here');
 
   let count = 0;
-  for (const uid of Object.keys(db.data.users)) {
+  for (const uid of Object.keys(db.users)) {
     try {
       await bot.telegram.sendMessage(uid, `📢 *Admin Message*\n\n${msg}`, { parse_mode: 'Markdown' });
       count++;
@@ -305,19 +289,13 @@ bot.command('broadcast', async (ctx) => {
   await ctx.reply(`Broadcast sent to ${count} users.`);
 });
 
-// ========== Error handling ==========
-bot.catch((err, ctx) => {
-  console.error('Bot error:', err);
-  ctx.reply('Something went wrong. Please try again.');
-});
-
 // ========== Launch ==========
-(async () => {
-  await initDB();
-  await bot.launch();
+bot.launch().then(() => {
   console.log('🪺 Nestly Free Telegram Bot is running!');
   console.log(`Admin ID: ${ADMIN_ID}`);
-})();
+}).catch(err => {
+  console.error('Failed to start bot:', err);
+});
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
