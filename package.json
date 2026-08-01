@@ -4,16 +4,14 @@
   "description": "Nestly Free Telegram Bot - Unlimited hosting panels",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js",
-    "dev": "node index.js"
+    "start": "node index.js"
   },
   "engines": {
     "node": ">=18"
   },
   "dependencies": {
     "dotenv": "^16.4.5",
-    "lowdb": "^7.0.1",
     "telegraf": "^4.16.3",
-    "uuid": "^10.0.0"
+    "uuid": "^9.0.1"
   }
 }
